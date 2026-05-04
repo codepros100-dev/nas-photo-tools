@@ -98,24 +98,66 @@ def select(conn, target=MAX_PHOTOS):
 
     cands.sort(key=score, reverse=True)
 
-    selected, phashes = [], []
-    bucket_counts = {}
+    # Group by year to enforce year coverage. Each year that has photos
+    # gets a guaranteed slice; remaining slots fill greedily.
+    by_year = {}
     for c in cands:
-        if len(selected) >= target:
-            break
+        by_year.setdefault(c['taken_year'] or 0, []).append(c)
+    years = sorted(by_year.keys(), reverse=True)
+    log(f'years available: {years}')
+
+    # Per-year guaranteed minimum (proportional to share of total) and cap
+    n_years = len(years)
+    if n_years == 0:
+        return []
+    base_per_year = max(2, target // (n_years * 2))    # at least 2 per year
+    cap_per_year = max(base_per_year * 4, target // 3)  # don't let one year dominate
+
+    selected, phashes = [], []
+    year_counts = {y: 0 for y in years}
+    bucket_counts = {}
+
+    def try_pick(c):
+        if c['phash']:
+            if any(hamming(c['phash'], p) < PHASH_THRESHOLD for p in phashes):
+                return False
         lat_g = round(c['gps_lat'], 1) if c['gps_lat'] is not None else None
         lon_g = round(c['gps_lon'], 1) if c['gps_lon'] is not None else None
         bk = (c['taken_year'], c['taken_month'], lat_g, lon_g)
         if bucket_counts.get(bk, 0) >= PER_BUCKET_CAP:
-            continue
-        if c['phash']:
-            if any(hamming(c['phash'], p) < PHASH_THRESHOLD for p in phashes):
-                continue
-            phashes.append(c['phash'])
+            return False
         bucket_counts[bk] = bucket_counts.get(bk, 0) + 1
+        if c['phash']:
+            phashes.append(c['phash'])
         selected.append(c)
+        year_counts[c['taken_year'] or 0] += 1
+        return True
 
-    log(f'selected {len(selected)} after diversity+dedupe')
+    # Pass 1: round-robin pick top photos from each year up to base_per_year
+    for slot in range(base_per_year):
+        for y in years:
+            if len(selected) >= target:
+                break
+            if year_counts[y] > slot:
+                continue
+            for c in by_year[y]:
+                if c in selected:
+                    continue
+                if try_pick(c):
+                    break
+
+    # Pass 2: greedy fill remaining slots from global ranking, capped per year
+    for c in cands:
+        if len(selected) >= target:
+            break
+        if c in selected:
+            continue
+        y = c['taken_year'] or 0
+        if year_counts[y] >= cap_per_year:
+            continue
+        try_pick(c)
+
+    log(f'selected {len(selected)} after diversity+dedupe (years: {sorted(set(year_counts) & set(c["taken_year"] or 0 for c in selected))})')
     return selected
 
 
