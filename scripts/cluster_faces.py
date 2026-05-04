@@ -46,6 +46,56 @@ def load_embeddings(conn):
     return ids, embs
 
 
+def cluster_centroid_merge(embs, labels, threshold):
+    """Second-pass: merge clusters whose centroids are within threshold.
+    Resolves over-fragmentation that complete-linkage causes when the same
+    person appears under varying lighting/angle."""
+    n_clusters = int(labels.max()) + 1 if len(labels) else 0
+    if n_clusters < 2:
+        return labels
+    # Compute centroids
+    centroids = np.zeros((n_clusters, embs.shape[1]), dtype=np.float32)
+    counts = np.zeros(n_clusters, dtype=int)
+    for i, l in enumerate(labels):
+        centroids[l] += embs[i]
+        counts[l] += 1
+    centroids /= np.maximum(counts[:, None], 1)
+    # Re-normalize for cosine
+    norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    centroids /= norms
+
+    # Greedy merge: for each cluster, find nearest unmerged centroid
+    parent = list(range(n_clusters))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    sims = centroids @ centroids.T
+    np.fill_diagonal(sims, -1.0)
+    # Process by descending similarity
+    pairs = []
+    for i in range(n_clusters):
+        for j in range(i + 1, n_clusters):
+            d = 1.0 - float(sims[i, j])
+            if d < threshold:
+                pairs.append((d, i, j))
+    pairs.sort()
+    for _, i, j in pairs:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    # Compact
+    new_labels = np.array([find(int(l)) for l in labels])
+    unique = sorted(set(int(x) for x in new_labels))
+    remap = {old: new for new, old in enumerate(unique)}
+    return np.array([remap[int(x)] for x in new_labels], dtype=int)
+
+
 def cluster_agglomerative(embs, distance):
     """Greedy complete-linkage clustering. A point joins an existing cluster
     only if its distance to *every* member is below the threshold (no chaining).
@@ -90,11 +140,13 @@ def cluster_agglomerative(embs, distance):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--distance', type=float, default=DEFAULT_DISTANCE,
-                        help='cosine distance threshold (lower = stricter)')
+                        help='cosine distance threshold for complete-linkage pass')
+    parser.add_argument('--merge', type=float, default=0.40,
+                        help='centroid-merge threshold (second pass). 0 to skip.')
     args = parser.parse_args()
 
     log('=' * 60)
-    log(f'Clustering with distance={args.distance}')
+    log(f'Clustering: complete-linkage d={args.distance}, centroid-merge d={args.merge}')
 
     conn = sqlite3.connect(str(DB_PATH))
     ids, embs = load_embeddings(conn)
@@ -105,7 +157,12 @@ def main():
 
     labels = cluster_agglomerative(embs, args.distance)
     n_clusters = int(labels.max()) + 1 if len(labels) else 0
-    log(f'Formed {n_clusters} clusters')
+    log(f'After pass 1 (complete-linkage): {n_clusters} clusters')
+
+    if args.merge > 0:
+        labels = cluster_centroid_merge(embs, labels, args.merge)
+        n_clusters = int(labels.max()) + 1
+        log(f'After pass 2 (centroid merge):  {n_clusters} clusters')
 
     # Distribution
     sizes = defaultdict(int)
