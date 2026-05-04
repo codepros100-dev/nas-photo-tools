@@ -1,10 +1,8 @@
 """Build a curated HTML photo album from photo_analysis.db.
 
 Selects ~200 diverse, high-quality photos:
-  * Boost photos with 1-4 faces (people-centric); slightly demote faceless ones
-  * Cap per (year, month, geo-bucket) for diversity
-  * Skip near-duplicates (perceptual hash Hamming < 8)
-
+  * Greedy by quality score, capped per (year, month, geo-bucket)
+  * Skips near-duplicates (perceptual hash Hamming < 8)
 Renders a single-file HTML album with grid view, year grouping, lightbox,
 and an interactive Leaflet map keyed off GPS data.
 """
@@ -22,8 +20,10 @@ from nas_config import PHOTO_LIBRARY_ROOT, PHOTO_DB_DIR
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 DB_PATH = PHOTO_DB_DIR / 'photo_analysis.db'
-DEFAULT_ALBUM_ROOT = Path.home() / 'PhotoAlbums'
+LIBRARY = PHOTO_LIBRARY_ROOT
+ALBUMS_ROOT = Path.home() / 'PhotoAlbums'
 THUMB_SIZE = (520, 520)
+LARGE_SIZE = (1920, 1920)
 MAX_PHOTOS = 200
 PER_BUCKET_CAP = 3
 PHASH_THRESHOLD = 8
@@ -58,6 +58,10 @@ def select(conn, target=MAX_PHOTOS):
     cands = [dict(zip([d[0] for d in cur.description], row)) for row in cur]
     log(f'{len(cands)} photo candidates  (faces enriched: {has_faces})')
 
+    # Score: quality * face_bonus
+    # Photos with a small group of faces (1-4) score highest (people-centric);
+    # crowded pics (>10 faces) get less boost; faceless landscape photos still
+    # qualify but with a lower base.
     def score(c):
         q = c['quality_score'] or 0
         if not has_faces or c['face_count'] is None or c['face_count'] < 0:
@@ -94,17 +98,34 @@ def select(conn, target=MAX_PHOTOS):
     return selected
 
 
+def make_resized(src, dest, size, quality=85, retries=3):
+    import time
+    for attempt in range(retries):
+        try:
+            with Image.open(src) as img:
+                img = ImageOps.exif_transpose(img)
+                img = img.convert('RGB')
+                img.thumbnail(size, Image.Resampling.LANCZOS)
+                img.save(dest, 'JPEG', quality=quality, optimize=True, progressive=True)
+            return True
+        except OSError as e:
+            if attempt < retries - 1:
+                time.sleep(2 + attempt * 5)
+                continue
+            log(f'resize fail {src.name}: {e}')
+            return False
+        except Exception as e:
+            log(f'resize fail {src.name}: {e}')
+            return False
+    return False
+
+
 def make_thumb(src, dest, size=THUMB_SIZE):
-    try:
-        with Image.open(src) as img:
-            img = ImageOps.exif_transpose(img)
-            img = img.convert('RGB')
-            img.thumbnail(size, Image.Resampling.LANCZOS)
-            img.save(dest, 'JPEG', quality=85, optimize=True, progressive=True)
-        return True
-    except Exception as e:
-        log(f'thumb fail {src.name}: {e}')
-        return False
+    return make_resized(src, dest, size, quality=85)
+
+
+def make_large(src, dest, size=LARGE_SIZE):
+    return make_resized(src, dest, size, quality=88)
 
 
 HTML = r'''<!doctype html>
@@ -127,10 +148,14 @@ header h1{font-size:34px;font-weight:700;letter-spacing:-0.02em;background:linea
 .stats div{display:flex;flex-direction:column;align-items:center;gap:4px}
 .stats strong{font-size:26px;font-weight:700;color:#fff}
 .stats span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em}
-nav{display:flex;justify-content:center;gap:6px;padding:14px;background:rgba(19,19,26,0.92);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;backdrop-filter:blur(10px)}
+nav{display:flex;justify-content:center;gap:6px;padding:14px;background:rgba(19,19,26,0.92);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100;backdrop-filter:blur(10px);flex-wrap:wrap}
 nav button{color:var(--muted);background:transparent;border:1px solid var(--border);padding:8px 18px;border-radius:24px;font-size:13px;cursor:pointer;font-weight:500;transition:all 0.15s}
 nav button:hover{color:#fff;border-color:#444}
 nav button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.year-nav{display:flex;justify-content:center;gap:4px;padding:10px 14px;background:rgba(13,13,17,0.92);border-bottom:1px solid var(--border);position:sticky;top:60px;z-index:99;backdrop-filter:blur(10px);flex-wrap:wrap}
+.year-nav a{color:var(--muted);text-decoration:none;padding:4px 10px;border-radius:12px;font-size:12px;transition:all 0.15s;font-variant-numeric:tabular-nums}
+.year-nav a:hover{color:#fff;background:var(--bg2)}
+.tile-badge{position:absolute;top:8px;right:8px;background:rgba(124,92,255,0.92);color:#fff;font-size:10px;font-weight:600;padding:2px 7px;border-radius:10px;letter-spacing:0.04em;backdrop-filter:blur(4px)}
 .section{display:none;animation:fade 0.3s}
 .section.active{display:block}
 @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
@@ -168,7 +193,9 @@ nav button.active{background:var(--accent);color:#fff;border-color:var(--accent)
 <nav>
   <button data-section="grid" class="active">Grid</button>
   <button data-section="map">Map</button>
+  <button id="slideshow-btn">▶ Slideshow</button>
 </nav>
+__YEAR_NAV__
 <main>
   <div id="grid" class="section active">__GRID__</div>
   <div id="map-section" class="section"><div id="map"></div></div>
@@ -193,16 +220,34 @@ function showLb(i){
   lbIdx=i;
   const p=PHOTOS[i];
   lbImg.src=p.full;
-  lbInfo.textContent=[p.date,p.location,p.camera].filter(Boolean).join(' · ')||'Photo '+(i+1);
+  const parts=[p.date,p.location,p.camera];
+  if(p.faces!=null&&p.faces>0)parts.push(p.faces+' face'+(p.faces>1?'s':''));
+  lbInfo.textContent=parts.filter(Boolean).join(' · ')||'Photo '+(i+1);
   lb.classList.add('open');
 }
+let slideshowTimer=null;
+function toggleSlideshow(){
+  const btn=document.getElementById('slideshow-btn');
+  if(slideshowTimer){
+    clearInterval(slideshowTimer);
+    slideshowTimer=null;
+    btn.textContent='▶ Slideshow';
+    return;
+  }
+  if(!lb.classList.contains('open'))showLb(0);
+  btn.textContent='⏸ Pause';
+  slideshowTimer=setInterval(()=>showLb((lbIdx+1)%PHOTOS.length),3500);
+}
+document.getElementById('slideshow-btn').addEventListener('click',toggleSlideshow);
 document.querySelectorAll('.tile').forEach(t=>{
   t.addEventListener('click',()=>showLb(parseInt(t.dataset.idx)));
 });
 lb.addEventListener('click',e=>{
   const a=e.target.dataset.act;
-  if(a==='close'||e.target===lb)lb.classList.remove('open');
-  else if(a==='prev')showLb((lbIdx-1+PHOTOS.length)%PHOTOS.length);
+  if(a==='close'||e.target===lb){
+    lb.classList.remove('open');
+    if(slideshowTimer){clearInterval(slideshowTimer);slideshowTimer=null;document.getElementById('slideshow-btn').textContent='▶ Slideshow';}
+  } else if(a==='prev')showLb((lbIdx-1+PHOTOS.length)%PHOTOS.length);
   else if(a==='next')showLb((lbIdx+1)%PHOTOS.length);
 });
 document.addEventListener('keydown',e=>{
@@ -248,8 +293,7 @@ window.showLb=showLb;
 '''
 
 
-def build(name=None, target=MAX_PHOTOS, library=PHOTO_LIBRARY_ROOT,
-          albums_root=DEFAULT_ALBUM_ROOT):
+def build(name=None, target=MAX_PHOTOS):
     if not DB_PATH.exists():
         log(f'No DB at {DB_PATH}; run analyze_photos.py first')
         sys.exit(1)
@@ -261,32 +305,52 @@ def build(name=None, target=MAX_PHOTOS, library=PHOTO_LIBRARY_ROOT,
 
     if not name:
         name = f'Auto-{datetime.now():%Y-%m-%d}'
-    album_dir = albums_root / name
+    album_dir = ALBUMS_ROOT / name
     thumb_dir = album_dir / 'thumbs'
+    large_dir = album_dir / 'large'
     thumb_dir.mkdir(parents=True, exist_ok=True)
+    large_dir.mkdir(parents=True, exist_ok=True)
     log(f'Building album at {album_dir}')
+
+    def safe_exists(p, retries=3):
+        import time
+        for attempt in range(retries):
+            try:
+                return p.exists()
+            except OSError:
+                if attempt < retries - 1:
+                    time.sleep(1 + attempt * 2)
+                else:
+                    return False
+        return False
 
     photos_data = []
     skipped = 0
     for i, p in enumerate(photos):
-        src = library / p['nas_path']
-        thumb_name = f'{i:04d}.jpg'
-        thumb_path = thumb_dir / thumb_name
-        if not thumb_path.exists() and not make_thumb(src, thumb_path):
-            skipped += 1
-            continue
+        src = LIBRARY / p['nas_path']
+        name_jpg = f'{i:04d}.jpg'
+        thumb_path = thumb_dir / name_jpg
+        large_path = large_dir / name_jpg
+        if not safe_exists(thumb_path):
+            if not make_thumb(src, thumb_path):
+                skipped += 1
+                continue
+        if not safe_exists(large_path):
+            make_large(src, large_path)
+            # If large failed, lightbox falls back to thumb path
         if (i + 1) % 25 == 0 or i == len(photos) - 1:
-            log(f'  thumbs {i + 1}/{len(photos)}')
+            log(f'  rendered {i + 1}/{len(photos)}')
         date_str = p['taken_at'][:10] if p['taken_at'] else (str(p['taken_year']) if p['taken_year'] else '')
         loc = ''
         if p['gps_lat'] is not None and p['gps_lon'] is not None:
             loc = f'{p["gps_lat"]:.3f}, {p["gps_lon"]:.3f}'
         camera = ' '.join(filter(None, [p.get('camera_make'), p.get('camera_model')])).strip()
         face_n = p.get('face_count')
+        full_url = f'large/{name_jpg}' if large_path.exists() else f'thumbs/{name_jpg}'
         photos_data.append({
             'idx': len(photos_data),
-            'thumb': f'thumbs/{thumb_name}',
-            'full': src.as_uri(),
+            'thumb': f'thumbs/{name_jpg}',
+            'full': full_url,
             'date': date_str,
             'year': p['taken_year'],
             'month': p['taken_month'],
@@ -304,19 +368,37 @@ def build(name=None, target=MAX_PHOTOS, library=PHOTO_LIBRARY_ROOT,
     for p in photos_data:
         by_year.setdefault(p['year'] or 0, []).append(p)
     grid = []
-    for yr in sorted(by_year, reverse=True):
+    sorted_years = sorted(by_year, reverse=True)
+    for yr in sorted_years:
         label = str(yr) if yr else 'Undated'
-        grid.append('<div class="year-group">')
+        anchor = f'y{yr}' if yr else 'yundated'
+        grid.append(f'<div class="year-group" id="{anchor}">')
         grid.append(f'<div class="year-label"><span class="yr">{label}</span><span>{len(by_year[yr])} photos</span></div>')
         grid.append('<div class="grid">')
         for p in by_year[yr]:
+            badge = ''
+            if p.get('faces') and 1 <= p['faces'] <= 6:
+                # Show small badge for "people-centric" shots
+                noun = 'face' if p['faces'] == 1 else 'faces'
+                badge = f'<div class="tile-badge">{p["faces"]} {noun}</div>'
             grid.append(
                 f'<div class="tile" data-idx="{p["idx"]}">'
                 f'<img src="{p["thumb"]}" loading="lazy" alt="">'
+                f'{badge}'
                 f'<div class="tile-meta"><span>{p["date"]}</span><span>{p["camera"][:18]}</span></div>'
                 f'</div>'
             )
         grid.append('</div></div>')
+
+    if len(sorted_years) > 1:
+        year_links = []
+        for yr in sorted_years:
+            label = str(yr) if yr else 'Undated'
+            anchor = f'y{yr}' if yr else 'yundated'
+            year_links.append(f'<a href="#{anchor}">{label}</a>')
+        year_nav = '<div class="year-nav">' + ''.join(year_links) + '</div>'
+    else:
+        year_nav = ''
 
     n_total = conn.execute('SELECT COUNT(*) FROM photos WHERE is_video=0').fetchone()[0]
     n_total_all = conn.execute('SELECT COUNT(*) FROM photos').fetchone()[0]
@@ -337,13 +419,14 @@ def build(name=None, target=MAX_PHOTOS, library=PHOTO_LIBRARY_ROOT,
     html = html.replace('__TITLE__', f'Photo Album · {name}')
     html = html.replace('__SUBTITLE__', f'Curated from {n_total:,} photos · generated {datetime.now():%B %d, %Y}')
     html = html.replace('__STATS__', stats)
+    html = html.replace('__YEAR_NAV__', year_nav)
     html = html.replace('__GRID__', '\n'.join(grid))
     html = html.replace('__PHOTOS_JSON__', json.dumps(photos_data, separators=(',', ':')))
 
     out = album_dir / 'index.html'
     out.write_text(html, encoding='utf-8')
     log(f'Wrote {out}')
-    log(f'Open: {out.as_uri()}')
+    log(f'Open: file:///{str(out).replace(chr(92), "/")}')
     conn.close()
     return out
 
@@ -352,8 +435,5 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--name', help='album folder name (default Auto-YYYY-MM-DD)')
     parser.add_argument('--target', type=int, default=MAX_PHOTOS, help='target photo count')
-    parser.add_argument('--library', type=Path, default=PHOTO_LIBRARY_ROOT)
-    parser.add_argument('--albums-root', type=Path, default=DEFAULT_ALBUM_ROOT)
     args = parser.parse_args()
-    build(name=args.name, target=args.target, library=args.library,
-          albums_root=args.albums_root)
+    build(name=args.name, target=args.target)
