@@ -15,11 +15,11 @@ from pathlib import Path
 
 from PIL import Image, ImageFile, ImageOps
 
-from nas_config import PHOTO_LIBRARY_ROOT, PHOTO_DB_DIR
-
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-DB_PATH = PHOTO_DB_DIR / 'photo_analysis.db'
+from nas_config import PHOTO_LIBRARY_ROOT, PHOTO_DB_DIR
+
+DB_PATH = PHOTO_DB_DIR / "photo_analysis.db"
 LIBRARY = PHOTO_LIBRARY_ROOT
 ALBUMS_ROOT = Path.home() / 'PhotoAlbums'
 THUMB_SIZE = (520, 520)
@@ -39,41 +39,62 @@ def hamming(a, b):
     return bin(int(a, 16) ^ int(b, 16)).count('1')
 
 
-def has_face_column(conn):
+def get_optional_columns(conn):
     cols = {row[1] for row in conn.execute('PRAGMA table_info(photos)')}
-    return 'face_count' in cols
+    return 'face_count' in cols, 'sharpness' in cols
 
 
 def select(conn, target=MAX_PHOTOS):
-    has_faces = has_face_column(conn)
-    face_select = ', face_count' if has_faces else ', NULL AS face_count'
+    has_faces, has_sharp = get_optional_columns(conn)
+    extra = []
+    if has_faces:
+        extra.append('face_count')
+    else:
+        extra.append('NULL AS face_count')
+    if has_sharp:
+        extra.append('sharpness')
+    else:
+        extra.append('NULL AS sharpness')
+    extra_sql = ', ' + ', '.join(extra)
     cur = conn.execute(f'''
         SELECT nas_path, file_size, width, height, taken_at, taken_year, taken_month,
                gps_lat, gps_lon, camera_make, camera_model, phash, quality_score
-               {face_select}
+               {extra_sql}
         FROM photos
         WHERE error IS NULL AND is_video = 0
           AND quality_score IS NOT NULL AND quality_score > 0
     ''')
     cands = [dict(zip([d[0] for d in cur.description], row)) for row in cur]
-    log(f'{len(cands)} photo candidates  (faces enriched: {has_faces})')
+    log(f'{len(cands)} candidates  (faces:{has_faces} sharp:{has_sharp})')
 
-    # Score: quality * face_bonus
-    # Photos with a small group of faces (1-4) score highest (people-centric);
-    # crowded pics (>10 faces) get less boost; faceless landscape photos still
-    # qualify but with a lower base.
+    # Score = quality * face_bonus * sharpness_bonus
     def score(c):
         q = c['quality_score'] or 0
-        if not has_faces or c['face_count'] is None or c['face_count'] < 0:
-            return q
-        n = c['face_count']
-        if n == 0:
-            return q * 0.85
-        if n <= 4:
-            return q * 1.5
-        if n <= 10:
-            return q * 1.2
-        return q * 1.0
+        # Face bonus
+        if has_faces and c['face_count'] is not None and c['face_count'] >= 0:
+            n = c['face_count']
+            if n == 0:
+                q *= 0.85
+            elif n <= 4:
+                q *= 1.5
+            elif n <= 10:
+                q *= 1.2
+            else:
+                q *= 1.0
+        # Sharpness bonus (Laplacian variance)
+        if has_sharp and c['sharpness'] is not None:
+            s = c['sharpness']
+            if s < 30:
+                q *= 0.4   # very blurry — almost never pick
+            elif s < 100:
+                q *= 0.8
+            elif s < 300:
+                q *= 1.0
+            elif s < 1000:
+                q *= 1.1
+            else:
+                q *= 1.15
+        return q
 
     cands.sort(key=score, reverse=True)
 
