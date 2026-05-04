@@ -17,10 +17,8 @@ from PIL import Image, ImageFile, ImageOps
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-from nas_config import PHOTO_LIBRARY_ROOT, PHOTO_DB_DIR
-
-DB_PATH = PHOTO_DB_DIR / "photo_analysis.db"
-LIBRARY = PHOTO_LIBRARY_ROOT
+DB_PATH = Path.home() / 'NAS' / 'photo_analysis.db'
+LIBRARY = Path('P:/Library')
 ALBUMS_ROOT = Path.home() / 'PhotoAlbums'
 THUMB_SIZE = (520, 520)
 LARGE_SIZE = (1920, 1920)
@@ -44,8 +42,41 @@ def get_optional_columns(conn):
     return 'face_count' in cols, 'sharpness' in cols
 
 
+def load_excluded_people():
+    """Load excluded_people.json (cluster IDs to drop). Returns set of ints."""
+    p = Path.home() / 'NAS' / 'excluded_people.json'
+    if not p.exists():
+        return set()
+    try:
+        data = json.loads(p.read_text(encoding='utf-8'))
+        return set(int(c) for c in data.get('excluded_clusters', []))
+    except Exception as e:
+        log(f'WARN: failed to load {p}: {e}')
+        return set()
+
+
+def excluded_photo_ids(conn, excluded_clusters):
+    """Return set of photo_ids that contain any face in excluded_clusters."""
+    if not excluded_clusters:
+        return set()
+    cur = conn.execute('PRAGMA table_info(faces)')
+    cols = {r[1] for r in cur}
+    if 'cluster_id' not in cols:
+        return set()
+    placeholders = ','.join('?' * len(excluded_clusters))
+    rows = conn.execute(
+        f'SELECT DISTINCT photo_id FROM faces WHERE cluster_id IN ({placeholders})',
+        list(excluded_clusters)
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
 def select(conn, target=MAX_PHOTOS):
     has_faces, has_sharp = get_optional_columns(conn)
+    excluded_clusters = load_excluded_people()
+    excluded_pids = excluded_photo_ids(conn, excluded_clusters)
+    if excluded_pids:
+        log(f'Excluding {len(excluded_pids)} photos containing {len(excluded_clusters)} unwanted people')
     extra = []
     if has_faces:
         extra.append('face_count')
@@ -57,7 +88,7 @@ def select(conn, target=MAX_PHOTOS):
         extra.append('NULL AS sharpness')
     extra_sql = ', ' + ', '.join(extra)
     cur = conn.execute(f'''
-        SELECT nas_path, file_size, width, height, taken_at, taken_year, taken_month,
+        SELECT id, nas_path, file_size, width, height, taken_at, taken_year, taken_month,
                gps_lat, gps_lon, camera_make, camera_model, phash, quality_score
                {extra_sql}
         FROM photos
@@ -65,6 +96,8 @@ def select(conn, target=MAX_PHOTOS):
           AND quality_score IS NOT NULL AND quality_score > 0
     ''')
     cands = [dict(zip([d[0] for d in cur.description], row)) for row in cur]
+    if excluded_pids:
+        cands = [c for c in cands if c['id'] not in excluded_pids]
     log(f'{len(cands)} candidates  (faces:{has_faces} sharp:{has_sharp})')
 
     # Score = quality * face_bonus * sharpness_bonus
