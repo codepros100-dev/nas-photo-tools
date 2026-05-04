@@ -1,0 +1,33 @@
+# Local config
+.env
+*.env
+
+# State files
+*.db
+*.db-journal
+*.log
+*.onnx
+
+# Generated albums
+albums/
+PhotoAlbums/
+
+# Hash DBs (user data)
+nas_photo_hashes.json
+unicode_rename_map.json
+photo_hashes.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
