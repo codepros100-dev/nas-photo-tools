@@ -17,8 +17,10 @@ from PIL import Image, ImageFile, ImageOps
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-DB_PATH = Path.home() / 'NAS' / 'photo_analysis.db'
-LIBRARY = Path('P:/Library')
+from nas_config import PHOTO_LIBRARY_ROOT, PHOTO_DB_DIR
+
+DB_PATH = PHOTO_DB_DIR / "photo_analysis.db"
+LIBRARY = PHOTO_LIBRARY_ROOT
 ALBUMS_ROOT = Path.home() / 'PhotoAlbums'
 THUMB_SIZE = (520, 520)
 LARGE_SIZE = (1920, 1920)
@@ -268,8 +270,12 @@ nav button.active{background:var(--accent);color:#fff;border-color:var(--accent)
 #map{height:calc(100vh - 100px);width:100%}
 .lightbox{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.96);z-index:1000;align-items:center;justify-content:center}
 .lightbox.open{display:flex}
-.lightbox img{max-width:100%;max-height:92vh;object-fit:contain}
-.lightbox-info{position:absolute;bottom:24px;left:50%;transform:translateX(-50%);background:rgba(20,20,24,0.85);padding:10px 22px;border-radius:30px;font-size:13px;color:#ddd;backdrop-filter:blur(10px);border:1px solid var(--border)}
+.lightbox img{max-width:100%;max-height:88vh;object-fit:contain}
+.lightbox-info{position:absolute;bottom:24px;left:50%;transform:translateX(-50%);background:rgba(20,20,24,0.85);padding:10px 22px;border-radius:30px;font-size:13px;color:#ddd;backdrop-filter:blur(10px);border:1px solid var(--border);display:flex;gap:14px;align-items:center;max-width:90vw;flex-wrap:wrap;justify-content:center}
+.lightbox-info span{white-space:nowrap}
+.lightbox-info a{color:#a89bff;text-decoration:none;padding:4px 10px;border:1px solid var(--border);border-radius:14px;font-size:12px;transition:all 0.15s}
+.lightbox-info a:hover{background:var(--bg2);color:#fff}
+.lightbox-info code{font-family:'SF Mono',Consolas,monospace;font-size:11px;color:var(--muted);max-width:50vw;overflow:hidden;text-overflow:ellipsis}
 .close-btn,.nav-btn{position:absolute;color:#fff;font-size:32px;cursor:pointer;user-select:none;opacity:0.6;transition:opacity 0.15s;padding:16px 24px}
 .close-btn{top:8px;right:16px}
 .nav-btn{top:50%;transform:translateY(-50%);font-size:48px}
@@ -316,9 +322,15 @@ function showLb(i){
   lbIdx=i;
   const p=PHOTOS[i];
   lbImg.src=p.full;
-  const parts=[p.date,p.location,p.camera];
-  if(p.faces!=null&&p.faces>0)parts.push(p.faces+' face'+(p.faces>1?'s':''));
-  lbInfo.textContent=parts.filter(Boolean).join(' · ')||'Photo '+(i+1);
+  const meta=[];
+  if(p.date) meta.push('<span>'+p.date+'</span>');
+  if(p.camera) meta.push('<span>'+p.camera+'</span>');
+  if(p.faces!=null&&p.faces>0) meta.push('<span>'+p.faces+' face'+(p.faces>1?'s':'')+'</span>');
+  if(p.location) meta.push('<span>'+p.location+'</span>');
+  if(p.original_uri) meta.push('<a href="'+p.original_uri+'" target="_blank" rel="noopener">📷 Original</a>');
+  if(p.folder_uri) meta.push('<a href="'+p.folder_uri+'" target="_blank" rel="noopener">📁 Folder</a>');
+  if(p.nas_path) meta.push('<code title="Path under \\\\192.168.1.181\\Photos\\Library\\">'+p.nas_path+'</code>');
+  lbInfo.innerHTML=meta.join('') || 'Photo '+(i+1);
   lb.classList.add('open');
 }
 let slideshowTimer=null;
@@ -443,10 +455,16 @@ def build(name=None, target=MAX_PHOTOS):
         camera = ' '.join(filter(None, [p.get('camera_make'), p.get('camera_model')])).strip()
         face_n = p.get('face_count')
         full_url = f'large/{name_jpg}' if large_path.exists() else f'thumbs/{name_jpg}'
+        # URI to the original photo on the NAS — opens at full resolution.
+        original_uri = src.as_uri()
+        folder_uri = src.parent.as_uri()
         photos_data.append({
             'idx': len(photos_data),
             'thumb': f'thumbs/{name_jpg}',
             'full': full_url,
+            'original_uri': original_uri,
+            'folder_uri': folder_uri,
+            'nas_path': p['nas_path'],
             'date': date_str,
             'year': p['taken_year'],
             'month': p['taken_month'],
