@@ -21,11 +21,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-INCOMING = Path('P:/Incoming')
-LIBRARY = Path('P:/Library')
-DUPLICATES = Path('P:/Duplicates')
-HASH_DB = Path.home() / 'NAS' / 'nas_photo_hashes.json'
-LOG_FILE = Path.home() / 'NAS' / 'process_incoming.log'
+from nas_config import PHOTO_LIBRARY_ROOT, PHOTO_DB_DIR, smb_connect, NAS_SHARE
+
+INCOMING = PHOTO_LIBRARY_ROOT.parent / 'Incoming'
+LIBRARY = PHOTO_LIBRARY_ROOT
+DUPLICATES = PHOTO_LIBRARY_ROOT.parent / 'Duplicates'
+HASH_DB = PHOTO_DB_DIR / 'nas_photo_hashes.json'
+LOG_FILE = PHOTO_DB_DIR / 'process_incoming.log'
 
 PHOTO_EXTS = {'.jpg', '.jpeg', '.png', '.heic', '.heif', '.gif', '.bmp',
               '.tiff', '.tif', '.webp', '.raw', '.cr2', '.nef', '.arw', '.dng'}

@@ -13,17 +13,17 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+from nas_config import PHOTO_LIBRARY_ROOT, PHOTO_DB_DIR, smb_connect, NAS_SHARE
 from smb.SMBConnection import SMBConnection
 
-NAS_HOST = '192.168.1.181'
-NAS_USER = 'chaim'
-NAS_PASS = 'MyPhotos2026'
-NAS_SHARE = 'Photos'
+# NAS credentials loaded from env via nas_config
+
 LIBRARY_PREFIX = 'Library'
 DUPLICATES_PREFIX = 'Duplicates'
 
-HASH_DB = Path.home() / 'NAS' / 'nas_photo_hashes.json'
-LOG_FILE = Path.home() / 'NAS' / 'find_nas_duplicates.log'
+HASH_DB = PHOTO_DB_DIR / 'nas_photo_hashes.json'
+LOG_FILE = PHOTO_DB_DIR / 'find_nas_duplicates.log'
 
 PHOTO_EXTS = {'.jpg', '.jpeg', '.png', '.heic', '.heif', '.gif', '.bmp',
               '.tiff', '.tif', '.webp', '.raw', '.cr2', '.nef', '.arw', '.dng'}
@@ -42,11 +42,6 @@ def log(msg):
         f.write(line + '\n')
 
 
-def smb_connect():
-    conn = SMBConnection(NAS_USER, NAS_PASS, 'LAPTOP', 'NSA320',
-                         use_ntlm_v2=True, is_direct_tcp=True)
-    conn.connect(NAS_HOST, 445, timeout=60)
-    return conn
 
 
 def list_recursive(conn, path):

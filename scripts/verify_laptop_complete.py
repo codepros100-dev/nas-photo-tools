@@ -15,9 +15,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-NAS_HASH_DB = Path.home() / 'NAS' / 'nas_photo_hashes.json'
-LOG_FILE = Path.home() / 'NAS' / 'verify_laptop_complete.log'
-INCOMING = Path('P:/Incoming')
+from nas_config import PHOTO_LIBRARY_ROOT, PHOTO_DB_DIR, smb_connect, NAS_SHARE
+
+NAS_HASH_DB = PHOTO_DB_DIR / 'nas_photo_hashes.json'
+LOG_FILE = PHOTO_DB_DIR / 'verify_laptop_complete.log'
+INCOMING = PHOTO_LIBRARY_ROOT.parent / 'Incoming'
 
 SOURCE_DIRS = [
     r'C:\Users\chaim\Desktop',
